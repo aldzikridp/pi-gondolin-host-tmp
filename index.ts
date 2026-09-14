@@ -389,9 +389,17 @@ export default function (pi: ExtensionAPI) {
 
 	function removeScratchMounts(): void {
 		if (!scratchRoot) return;
-		fs.rmSync(scratchRoot, { recursive: true, force: true });
+		try {
+			fs.rmSync(scratchRoot, { recursive: true, force: true });
+		} catch {
+			// best-effort: never fail shutdown over temp cleanup
+		}
 		scratchRoot = undefined;
 	}
+
+	// Backstop for exit paths that skip or abandon session_shutdown (print mode,
+	// process.exit, crash). rmSync is sync, which is all 'exit' allows.
+	process.on("exit", removeScratchMounts);
 
 	function createScratchMounts(): Record<string, RealFSProvider> {
 		removeScratchMounts(); // drop any root left behind by a failed earlier startVm attempt
