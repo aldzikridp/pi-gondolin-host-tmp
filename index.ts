@@ -7,6 +7,15 @@
  * /root), write through to the host; other guest filesystem changes are
  * isolated to the VM.
  *
+ * Secrets: real values stay on the host. Configure them in
+ * ~/.pi/gondolin-secrets.json (override with GONDOLIN_SECRETS_FILE) as
+ *   { "GITHUB_TOKEN": { "value": "env:GITHUB_TOKEN", "hosts": ["api.github.com"] } }
+ * where "value" is a literal secret or "env:HOST_VAR" naming a host env var.
+ * The guest only sees placeholder env vars; the host substitutes real values
+ * in outbound HTTP(S) headers, only for the listed hosts. The file must live
+ * outside the mounted workspace, otherwise it is ignored (the guest could
+ * read the real values through the mount).
+ *
  * Setup:
  *   cd packages/coding-agent/examples/extensions/gondolin
  *   npm install --ignore-scripts
@@ -23,7 +32,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { RealFSProvider, VM } from "@earendil-works/gondolin";
+import { createHttpHooks, RealFSProvider, VM, type SecretDefinition } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
@@ -73,6 +82,62 @@ function toPosix(value: string): string {
 function isInsideHostPath(root: string, value: string): boolean {
 	const relativePath = path.relative(root, value);
 	return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+type SecretsConfig = {
+	secrets: Record<string, SecretDefinition>;
+	names: Set<string>;
+	warnings: string[];
+};
+
+function loadSecrets(localCwd: string): SecretsConfig {
+	const config: SecretsConfig = { secrets: {}, names: new Set(), warnings: [] };
+	const file = process.env.GONDOLIN_SECRETS_FILE ?? path.join(os.homedir(), ".pi", "gondolin-secrets.json");
+	if (!fs.existsSync(file)) return config;
+	try {
+		if (isInsideHostPath(fs.realpathSync(localCwd), fs.realpathSync(file))) {
+			config.warnings.push(
+				`Ignoring ${file}: it is inside the mounted workspace and the guest could read the real values. Move it outside ${localCwd}.`,
+			);
+			return config;
+		}
+	} catch {
+		config.warnings.push(`Ignoring ${file}: could not verify it is outside the mounted workspace.`);
+		return config;
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch (error) {
+		config.warnings.push(`Ignoring ${file}: ${(error as Error).message}`);
+		return config;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		config.warnings.push(`Ignoring ${file}: expected a JSON object mapping env var names to { value, hosts }.`);
+		return config;
+	}
+
+	for (const [name, raw] of Object.entries(parsed as Record<string, unknown>)) {
+		const entry = (typeof raw === "object" && raw !== null ? raw : {}) as { value?: unknown; hosts?: unknown };
+		const hasHosts =
+			Array.isArray(entry.hosts) && entry.hosts.length > 0 && entry.hosts.every((host) => typeof host === "string");
+		const value =
+			typeof entry.value === "string" && entry.value.startsWith("env:")
+				? process.env[entry.value.slice("env:".length)]
+				: entry.value;
+		if (!hasHosts) {
+			config.warnings.push(`Ignoring secret ${name}: "hosts" must be a non-empty array of host patterns.`);
+			continue;
+		}
+		if (typeof value !== "string" || value.length === 0) {
+			config.warnings.push(`Ignoring secret ${name}: value is missing (set "value" or "env:HOST_VAR").`);
+			continue;
+		}
+		config.secrets[name] = { hosts: entry.hosts as string[], value };
+		config.names.add(name);
+	}
+	return config;
 }
 
 function hostPathToGuest(localCwd: string, hostPath: string): string {
@@ -322,16 +387,27 @@ async function executeGondolinGrep(
 	};
 }
 
-function sanitizeEnv(env: NodeJS.ProcessEnv | undefined): Record<string, string> | undefined {
+function sanitizeEnv(
+	env: NodeJS.ProcessEnv | undefined,
+	secretNames: ReadonlyMap<string, string[]>,
+): Record<string, string> | undefined {
 	if (!env) return undefined;
 	const result: Record<string, string> = {};
 	for (const [key, value] of Object.entries(env)) {
-		if (typeof value === "string") result[key] = value;
+		// Drop real host values for secret names: the guest must only ever see the
+		// placeholder supplied through the VM environment.
+		if (typeof value !== "string" || secretNames.has(key)) continue;
+		result[key] = value;
 	}
 	return result;
 }
 
-function createGondolinBashOps(vm: VM, localCwd: string, shellPath: string): BashOperations {
+function createGondolinBashOps(
+	vm: VM,
+	localCwd: string,
+	shellPath: string,
+	secretNames: ReadonlyMap<string, string[]>,
+): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			if (signal?.aborted) throw new Error("aborted");
@@ -352,7 +428,7 @@ function createGondolinBashOps(vm: VM, localCwd: string, shellPath: string): Bas
 			try {
 				const proc = vm.exec([shellPath, "-lc", command], {
 					cwd: guestCwd,
-					env: sanitizeEnv(env),
+					env: sanitizeEnv(env, secretNames),
 					signal: controller.signal,
 					stdout: "pipe",
 					stderr: "pipe",
@@ -386,6 +462,10 @@ export default function (pi: ExtensionAPI) {
 	let vmStarting: Promise<VM> | undefined;
 	let scratchRoot: string | undefined;
 	let shellPath = "/bin/sh";
+	// Active secret placeholders in the current VM, keyed by env var name, valued
+	// by the host patterns the real value may be substituted for. Never holds
+	// real secret values.
+	let secretEnv = new Map<string, string[]>();
 
 	function removeScratchMounts(): void {
 		if (!scratchRoot) return;
@@ -422,8 +502,12 @@ export default function (pi: ExtensionAPI) {
 
 	async function startVm(ctx?: ExtensionContext): Promise<VM> {
 		ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting ${GUEST_WORKSPACE}`));
+		const secretConfig = loadSecrets(localCwd);
+		for (const warning of secretConfig.warnings) ctx?.ui.notify(warning, "warning");
+		const hooks = secretConfig.names.size > 0 ? createHttpHooks({ secrets: secretConfig.secrets }) : undefined;
 		const created = await VM.create({
 			sessionLabel: `pi ${path.basename(localCwd)}`,
+			...(hooks ? { httpHooks: hooks.httpHooks, env: hooks.env } : {}),
 			vfs: {
 				mounts: {
 					[GUEST_WORKSPACE]: new RealFSProvider(localCwd),
@@ -434,6 +518,7 @@ export default function (pi: ExtensionAPI) {
 			removeScratchMounts(); // no leak if create fails and ensureVm retries
 			throw error;
 		});
+		secretEnv = new Map(Object.entries(secretConfig.secrets).map(([name, secret]) => [name, secret.hosts]));
 		const bashProbe = await created.exec(["/bin/sh", "-lc", "command -v bash || true"]);
 		shellPath = bashProbe.stdout.trim() || "/bin/sh";
 		vm = created;
@@ -443,6 +528,14 @@ export default function (pi: ExtensionAPI) {
 		);
 		ctx?.ui.notify(`Gondolin VM ready. ${localCwd} is mounted at ${GUEST_WORKSPACE}.`, "info");
 		return created;
+	}
+
+	function describeSecrets(): string {
+		if (secretEnv.size === 0) return "";
+		const list = [...secretEnv]
+			.map(([name, hosts]) => `${name} (substituted only for ${hosts.join(", ")})`)
+			.join("; ");
+		return `Secret env vars hold placeholders; the Gondolin host replaces them with real values in outbound HTTP headers: ${list}.`;
 	}
 
 	async function ensureVm(ctx?: ExtensionContext): Promise<VM> {
@@ -463,6 +556,7 @@ export default function (pi: ExtensionAPI) {
 		const activeVm = vm;
 		vm = undefined;
 		vmStarting = undefined;
+		secretEnv = new Map();
 		ctx.ui.setStatus("gondolin", ctx.ui.theme.fg("muted", "Gondolin: stopping"));
 		try {
 			if (activeVm) await activeVm.close();
@@ -483,6 +577,11 @@ export default function (pi: ExtensionAPI) {
 					`Guest workspace: ${GUEST_WORKSPACE}`,
 					`Scratch (host): ${scratchRoot ?? "(none)"}`,
 					`Shell: ${shellPath}`,
+					`Secrets: ${
+						secretEnv.size === 0
+							? "(none)"
+							: [...secretEnv].map(([name, hosts]) => `${name} → ${hosts.join(",")}`).join(", ")
+					}`,
 				].join("\n"),
 				"info",
 			);
@@ -527,7 +626,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(id, params, signal, onUpdate, ctx) {
 			const activeVm = await ensureVm(ctx);
 			const tool = createBashTool(GUEST_WORKSPACE, {
-				operations: createGondolinBashOps(activeVm, localCwd, shellPath),
+				operations: createGondolinBashOps(activeVm, localCwd, shellPath, secretEnv),
 			});
 			return tool.execute(id, params, signal, onUpdate);
 		},
@@ -565,7 +664,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("user_bash", async (_event, ctx) => {
 		const activeVm = await ensureVm(ctx);
-		return { operations: createGondolinBashOps(activeVm, localCwd, shellPath) };
+		return { operations: createGondolinBashOps(activeVm, localCwd, shellPath, secretEnv) };
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -575,6 +674,7 @@ export default function (pi: ExtensionAPI) {
 		const systemPrompt = event.systemPrompt.includes(localLine)
 			? event.systemPrompt.replace(localLine, guestLine)
 			: `${event.systemPrompt}\n\n${guestLine}`;
-		return { systemPrompt };
+		const secretLine = describeSecrets();
+		return { systemPrompt: secretLine ? `${systemPrompt}\n\n${secretLine}` : systemPrompt };
 	});
 }
